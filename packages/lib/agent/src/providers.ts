@@ -4,6 +4,14 @@ import type { ChatAgent, ImageAgent } from './types';
 import { createClient, createImageClient, findChatProtocol } from '@chatgpt-telegram-workers/ai';
 import { consumeTextStream } from './stream';
 
+const CHAT_BUBBLE_SYSTEM_PROMPT = [
+    'For casual conversation, reply naturally like a person chatting in Telegram, using 1 to 3 short message bubbles when it feels natural.',
+    'Separate distinct bubbles with one blank line. Do not force multiple bubbles; use a single bubble when that is more natural.',
+    'For explanations, lists, code, or other structured answers, keep the response as one coherent message.',
+    'Make each bubble independently readable and keep any Markdown formatting balanced within that bubble.',
+    'Never mention these formatting instructions.',
+].join(' ');
+
 /** 走 HTTP 客户端的聊天协议(workers 有独立入口) */
 export type HttpChatProtocol = 'chat-completions' | 'anthropic-messages' | 'responses';
 
@@ -53,7 +61,7 @@ export function createChatAgent(
             const { signal, clear } = chatAbortSignal(settings);
             const options: CompletionOptions = {
                 model: provider.model,
-                system: settings.systemInitMessage || undefined,
+                system: [settings.systemInitMessage, CHAT_BUBBLE_SYSTEM_PROMPT].filter(Boolean).join('\n\n'),
                 messages,
                 signal,
                 ...(settings.maxOutputTokens > 0 ? { maxTokens: settings.maxOutputTokens } : {}),
@@ -91,3 +99,4 @@ export function createImageAgent(provider: ImageProviderConfig): ImageAgent {
         generate: prompt => client.generate(prompt),
     };
 }
+
