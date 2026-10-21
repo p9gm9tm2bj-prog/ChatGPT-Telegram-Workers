@@ -4,6 +4,7 @@ import type { WorkerContext } from '../context';
 import { loadChatLLM, requestCompletionsFromLLM } from '@chatgpt-telegram-workers/agent';
 import { ENV } from '@chatgpt-telegram-workers/config';
 import { createTelegramBotAPI, MessageSender } from '@chatgpt-telegram-workers/telegram';
+import { ASSISTANT_BUBBLE_DELAY_MS, splitAssistantBubbles } from './bubbles';
 
 export async function chatWithMessage(
     message: Telegram.Message,
@@ -32,37 +33,9 @@ export async function chatWithMessage(
                     .catch(console.error),
             0,
         );
-        let onStream: StreamHandler | null = null;
-        let nextEnableTime: number | null = null;
-        if (ENV.CONFIG.settings.streamMode) {
-            onStream = async (text: string): Promise<any> => {
-                try {
-                    // 判断是否需要等待
-                    if (nextEnableTime && nextEnableTime > Date.now()) {
-                        return;
-                    }
-                    const resp = await sender.sendPlainText(text);
-                    // 判断429
-                    if (resp.status === 429) {
-                        // 获取重试时间
-                        const retryAfter = Number.parseInt(resp.headers.get('Retry-After') || '');
-                        if (retryAfter) {
-                            nextEnableTime = Date.now() + retryAfter * 1000;
-                            return;
-                        }
-                    }
-                    nextEnableTime = null;
-                    if (resp.ok) {
-                        const respJson = (await resp.json()) as Telegram.ResponseWithMessage;
-                        sender.update({
-                            message_id: respJson.result.message_id,
-                        });
-                    }
-                } catch (e) {
-                    console.error(e);
-                }
-            };
-        }
+        // Keep consuming the provider stream when enabled, but don't edit one Telegram
+        // bubble while tokens arrive; the completed answer is split into bubbles below.
+        const onStream: StreamHandler | null = ENV.CONFIG.settings.streamMode ? async () => {} : null;
 
         const agent = loadChatLLM(ENV.CONFIG);
         if (agent === null) {
@@ -76,10 +49,23 @@ export async function chatWithMessage(
             modifier,
             onStream,
         );
-        if (nextEnableTime !== null && nextEnableTime > Date.now()) {
-            await new Promise(resolve => setTimeout(resolve, (nextEnableTime ?? 0) - Date.now()));
+        const bubbles = splitAssistantBubbles(answer);
+        if (bubbles.length === 0) {
+            return sender.sendRichText(answer);
         }
-        return sender.sendRichText(answer);
+        let lastResponse: Response | null = null;
+        for (const [index, bubble] of bubbles.entries()) {
+            if (index > 0) {
+                // The first response edits the typing placeholder; subsequent bubbles are new messages.
+                sender.update({ message_id: null });
+                await new Promise(resolve => setTimeout(resolve, ASSISTANT_BUBBLE_DELAY_MS));
+            }
+            lastResponse = await sender.sendRichText(bubble);
+            if (!lastResponse.ok) {
+                return lastResponse;
+            }
+        }
+        return lastResponse!;
     } catch (e) {
         let errMsg = `Error: ${(e as Error).message}`;
         if (errMsg.length > 2048) {
@@ -157,3 +143,4 @@ export async function extractUserMessageItem(message: Telegram.Message, context:
     }
     return params;
 }
+
