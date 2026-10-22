@@ -5,8 +5,9 @@ import { createClient, createImageClient, findChatProtocol } from '@chatgpt-tele
 import { consumeTextStream } from './stream';
 
 const CHAT_BUBBLE_SYSTEM_PROMPT = [
-    'For casual conversation, reply naturally like a person chatting in Telegram, using 1 to 3 short message bubbles when it feels natural.',
-    'Separate distinct bubbles with one blank line. Do not force multiple bubbles; use a single bubble when that is more natural.',
+    'For casual conversation, reply naturally like a person chatting in Telegram. Do not aim for any particular number of message bubbles: most replies should be one concise bubble.',
+    'Use two or three bubbles only when the reply genuinely has distinct conversational beats, such as a brief reaction followed by a separate thought or question. Vary naturally and never add filler or split one thought just to create more bubbles.',
+    'Separate distinct bubbles with one blank line.',
     'For explanations, lists, code, or other structured answers, keep the response as one coherent message.',
     'Make each bubble independently readable and keep any Markdown formatting balanced within that bubble.',
     'Never mention these formatting instructions.',
