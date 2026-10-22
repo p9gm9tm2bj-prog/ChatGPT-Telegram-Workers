@@ -790,7 +790,7 @@ async function run(): Promise<void> {
             s.finish();
         }
 
-        // ------------------------------------------------------- 12. streaming
+        // ------------------------------------------ 12. streaming into chat bubbles
         {
             const s = new Scenario('streaming');
             const chatId = WHITELIST_USER;
@@ -800,7 +800,7 @@ async function run(): Promise<void> {
                     { id: 'mock-chat', baseUrl: `${llmUrl}/v1`, model: 'mock-model', models: ['mock-model'] },
                 ],
             });
-            llm.setStream({ chunks: ['Hello ', 'from ', 'the ', 'stream!'], delayMs: 0 });
+            llm.setStream({ chunks: ['Hello from the stream!', '\n\n', 'A second bubble.'], delayMs: 0 });
             telegram.reset();
             await botClient.sendUpdate(
                 textMessage({ chatId, userId: WHITELIST_USER, text: 'stream please' }),
@@ -808,14 +808,14 @@ async function run(): Promise<void> {
             );
             const texts = telegram.textsFor(chatId);
             s.expect(
-                'streaming produced edits',
-                telegram.callsFor('editMessageText').length >= 1,
+                'completed stream is split into two bubbles',
+                texts.includes('Hello from the stream!') && texts.includes('A second bubble.'),
                 JSON.stringify(texts),
             );
             s.expect(
-                'final text contains streamed content',
-                texts.some(t => t.includes('stream')),
-                JSON.stringify(texts),
+                'stream is not leaked as repeated edits',
+                telegram.callsFor('editMessageText').length === 1,
+                `edit count: ${telegram.callsFor('editMessageText').length}`,
             );
             s.finish();
         }
@@ -845,3 +845,4 @@ run()
         console.error(e);
         process.exit(1);
     });
+
