@@ -80,6 +80,7 @@ export async function requestCompletionsFromLLM(
     agent: ChatAgent,
     modifier: HistoryModifier | null,
     onStream: StreamHandler | null,
+    onMessage?: (text: string) => Promise<unknown>,
 ): Promise<string> {
     if (!historyKey) {
         throw new Error('History key not found');
@@ -97,7 +98,7 @@ export async function requestCompletionsFromLLM(
         throw new Error('Message is empty');
     }
 
-    const text = await agent.chat([...history, message], onStream);
+    const text = await agent.chat([...history, message], onStream, onMessage);
     if (!historyDisabled) {
         const stored = historyImagePlaceholder ? stripImages(message, historyImagePlaceholder) : message;
         const next: Message[] = [...history, stored, { role: 'assistant', content: text }];
