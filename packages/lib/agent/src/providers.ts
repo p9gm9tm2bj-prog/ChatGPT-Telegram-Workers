@@ -55,6 +55,11 @@ export async function completeWithMessageActions(
             }
             const text = result.text.trim();
             const toolCalls = result.toolCalls ?? [];
+            console.info('[chat-message-diagnostic]', {
+                decision: toolCalls.length > 0 ? 'tool_calls' : 'final_text',
+                toolCalls: toolCalls.map(call => call.function.name),
+                deliveredCount: delivered.length,
+            });
 
             // No action call means the model chose to finish this turn naturally.
             if (toolCalls.length === 0) {
