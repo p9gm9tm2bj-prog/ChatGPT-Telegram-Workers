@@ -68,6 +68,57 @@ describe('buildChatCompletionsBody', () => {
         );
         expect(body.messages).toEqual([{ role: 'system', content: 'sys' }]);
     });
+
+    it('serializes tool definitions, assistant tool calls, and tool results', () => {
+        const body = buildChatCompletionsBody(
+            {
+                model: 'deepseek-flash',
+                tools: [
+                    {
+                        type: 'function',
+                        function: {
+                            name: 'send_message',
+                            parameters: { type: 'object', properties: { text: { type: 'string' } } },
+                        },
+                    },
+                ],
+                messages: [
+                    {
+                        role: 'assistant',
+                        content: '',
+                        reasoning_content: 'I can answer briefly.',
+                        tool_calls: [
+                            {
+                                id: 'call_1',
+                                type: 'function',
+                                function: { name: 'send_message', arguments: '{"text":"Hi"}' },
+                            },
+                        ],
+                    },
+                    { role: 'tool', tool_call_id: 'call_1', content: 'Message sent.' },
+                ],
+            },
+            false,
+        );
+
+        expect(body.tool_choice).toBe('auto');
+        expect(body.tools[0].function.name).toBe('send_message');
+        expect(body.messages).toEqual([
+            {
+                role: 'assistant',
+                content: '',
+                reasoning_content: 'I can answer briefly.',
+                tool_calls: [
+                    {
+                        id: 'call_1',
+                        type: 'function',
+                        function: { name: 'send_message', arguments: '{"text":"Hi"}' },
+                    },
+                ],
+            },
+            { role: 'tool', content: 'Message sent.', tool_call_id: 'call_1' },
+        ]);
+    });
 });
 
 describe('parseChatCompletionsResponse', () => {
@@ -99,6 +150,33 @@ describe('parseChatCompletionsResponse', () => {
                 ],
             }).text,
         ).toBe('ab');
+    });
+
+    it('preserves tool calls and reasoning for a subsequent model turn', () => {
+        expect(
+            parseChatCompletionsResponse({
+                choices: [
+                    {
+                        message: {
+                            content: '',
+                            reasoning_content: 'I will send one short message.',
+                            tool_calls: [
+                                {
+                                    id: 'call_1',
+                                    type: 'function',
+                                    function: { name: 'send_message', arguments: '{"text":"Hi"}' },
+                                },
+                            ],
+                        },
+                        finish_reason: 'tool_calls',
+                    },
+                ],
+            }),
+        ).toMatchObject({
+            text: '',
+            reasoningContent: 'I will send one short message.',
+            toolCalls: [{ id: 'call_1', function: { name: 'send_message' } }],
+        });
     });
 });
 
