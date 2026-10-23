@@ -21,11 +21,32 @@ export interface ImagePart {
 
 export type Part = TextPart | ImagePart;
 
-export type Role = 'system' | 'user' | 'assistant';
+export type Role = 'system' | 'user' | 'assistant' | 'tool';
+
+export interface FunctionToolCall {
+    id: string;
+    type: 'function';
+    function: {
+        name: string;
+        arguments: string;
+    };
+}
 
 export interface Message {
     role: Role;
     content: string | Part[];
+    tool_call_id?: string;
+    tool_calls?: FunctionToolCall[];
+    reasoning_content?: string;
+}
+
+export interface FunctionTool {
+    type: 'function';
+    function: {
+        name: string;
+        description?: string;
+        parameters?: Record<string, unknown>;
+    };
 }
 
 export interface Usage {
@@ -45,12 +66,16 @@ export interface CompletionOptions {
     signal?: AbortSignal;
     headers?: Record<string, string>;
     extra?: Record<string, unknown>;
+    tools?: FunctionTool[];
+    toolChoice?: 'auto' | 'none' | 'required';
 }
 
 export interface CompletionResult {
     text: string;
     usage?: Usage;
     stopReason?: string | null;
+    toolCalls?: FunctionToolCall[];
+    reasoningContent?: string;
 }
 
 /** 聊天协议标识(与 protocols.ts 的 ChatProtocol 同一来源) */
