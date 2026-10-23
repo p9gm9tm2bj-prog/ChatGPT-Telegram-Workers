@@ -49,12 +49,18 @@ function renderPart(part: Part): any | null {
 }
 
 function renderMessage(message: Message): any {
+    const metadata = {
+        ...(message.tool_call_id ? { tool_call_id: message.tool_call_id } : {}),
+        ...(message.tool_calls ? { tool_calls: message.tool_calls } : {}),
+        ...(message.reasoning_content ? { reasoning_content: message.reasoning_content } : {}),
+    };
     if (typeof message.content === 'string') {
-        return { role: message.role, content: message.content };
+        return { role: message.role, content: message.content, ...metadata };
     }
     return {
         role: message.role,
         content: message.content.map(renderPart).filter(part => part !== null),
+        ...metadata,
     };
 }
 
@@ -71,6 +77,8 @@ export function buildChatCompletionsBody(options: CompletionOptions, stream: boo
         ...(options.temperature !== undefined ? { temperature: options.temperature } : {}),
         ...(options.topP !== undefined ? { top_p: options.topP } : {}),
         ...(options.stop ? { stop: options.stop } : {}),
+        ...(options.tools?.length ? { tools: options.tools } : {}),
+        ...(options.tools?.length ? { tool_choice: options.toolChoice || 'auto' } : {}),
         messages: messages.map(renderMessage),
     };
 }
@@ -87,6 +95,10 @@ export function parseChatCompletionsResponse(data: any): CompletionResult {
         text: contentToText(choice.message?.content),
         usage: toUsage(data?.usage),
         stopReason: choice?.finish_reason ?? null,
+        ...(Array.isArray(choice.message?.tool_calls) ? { toolCalls: choice.message.tool_calls } : {}),
+        ...(typeof choice.message?.reasoning_content === 'string'
+            ? { reasoningContent: choice.message.reasoning_content }
+            : {}),
     };
 }
 
