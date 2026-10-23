@@ -4,7 +4,6 @@ import type { WorkerContext } from '../context';
 import { loadChatLLM, requestCompletionsFromLLM } from '@chatgpt-telegram-workers/agent';
 import { ENV } from '@chatgpt-telegram-workers/config';
 import { createTelegramBotAPI, MessageSender } from '@chatgpt-telegram-workers/telegram';
-import { ASSISTANT_BUBBLE_DELAY_MS, splitAssistantBubbles } from './bubbles';
 
 export async function chatWithMessage(
     message: Telegram.Message,
@@ -33,9 +32,20 @@ export async function chatWithMessage(
                     .catch(console.error),
             0,
         );
-        // Keep consuming the provider stream when enabled, but don't edit one Telegram
-        // bubble while tokens arrive; the completed answer is split into bubbles below.
+        // The current chat-completions path emits each model-selected message as it is chosen.
+        // Other providers keep their existing single-response behavior.
         const onStream: StreamHandler | null = ENV.CONFIG.settings.streamMode ? async () => {} : null;
+        let sentByAgent = 0;
+        const onMessage = async (text: string) => {
+            const response = await sender.sendRichText(text);
+            if (!response.ok) {
+                throw new Error(`Telegram message send failed (${response.status})`);
+            }
+            sentByAgent++;
+            // First send edits the initial placeholder; following sends create new bubbles.
+            sender.update({ message_id: null });
+            return response;
+        };
 
         const agent = loadChatLLM(ENV.CONFIG);
         if (agent === null) {
@@ -48,24 +58,12 @@ export async function chatWithMessage(
             agent,
             modifier,
             onStream,
+            onMessage,
         );
-        const bubbles = splitAssistantBubbles(answer);
-        if (bubbles.length === 0) {
-            return sender.sendRichText(answer);
+        if (sentByAgent > 0) {
+            return new Response('Messages sent', { status: 200 });
         }
-        let lastResponse: Response | null = null;
-        for (const [index, bubble] of bubbles.entries()) {
-            if (index > 0) {
-                // The first response edits the typing placeholder; subsequent bubbles are new messages.
-                sender.update({ message_id: null });
-                await new Promise(resolve => setTimeout(resolve, ASSISTANT_BUBBLE_DELAY_MS));
-            }
-            lastResponse = await sender.sendRichText(bubble);
-            if (!lastResponse.ok) {
-                return lastResponse;
-            }
-        }
-        return lastResponse!;
+        return sender.sendRichText(answer);
     } catch (e) {
         let errMsg = `Error: ${(e as Error).message}`;
         if (errMsg.length > 2048) {
@@ -143,4 +141,3 @@ export async function extractUserMessageItem(message: Telegram.Message, context:
     }
     return params;
 }
-

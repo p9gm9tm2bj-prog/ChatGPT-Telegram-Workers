@@ -1,6 +1,6 @@
-import type { Message, Part } from '@chatgpt-telegram-workers/ai';
+import type { FunctionToolCall, Message, Part } from '@chatgpt-telegram-workers/ai';
 
-export type { Message, Part };
+export type { FunctionToolCall, Message, Part };
 
 /** 流式输出回调,参数为当前累计文本 */
 export type StreamHandler = (text: string) => Promise<unknown>;
@@ -22,7 +22,11 @@ export interface AgentBase {
 
 export interface ChatAgent extends AgentBase {
     /** 发送一轮对话,返回助手最终文本;onStream 非空时以增量文本回调 */
-    chat: (messages: Message[], onStream: StreamHandler | null) => Promise<string>;
+    chat: (
+        messages: Message[],
+        onStream: StreamHandler | null,
+        onMessage?: (text: string) => Promise<unknown>,
+    ) => Promise<string>;
 }
 
 export interface ImageAgent extends AgentBase {
