@@ -8,6 +8,7 @@ const CHAT_MESSAGE_SYSTEM_PROMPT = [
     'You are chatting on Telegram. Return a JSON object of the form {"messages":["..."]}.',
     'Each string in messages is sent as one separate Telegram chat bubble, in order.',
     'Use one string when one message is enough. Use several strings when your reply naturally consists of separate thoughts, reactions, or chat lines.',
+    'Always include at least one message in the array; never return empty content.',
     'Do not mechanically split sentences and do not add filler just to make more bubbles.',
     'Do not mention this JSON format. Keep your configured persona, tone, and humor.',
 ].join(' ');
@@ -105,35 +106,71 @@ export async function completeWithMessageActions(
         result = await client.complete(baseOptions);
     }
 
-    const rawText = result.text.trim();
-    const parsed = parseBubbleEnvelope(rawText);
-    const capHit = parsed.texts.length > MAX_CHAT_MESSAGES_PER_TURN;
-    const sent: string[] = [];
+    let rawText = result.text.trim();
+    let parsed = parseBubbleEnvelope(rawText);
+    let activeParsed = parsed;
+    let sent: string[] = [];
+    let path: 'json' | 'text_fallback' | 'empty' = 'empty';
+    let fallbackUsed = false;
+    let emptyEnvelope = false;
 
-    for (const message of parsed.texts.slice(0, MAX_CHAT_MESSAGES_PER_TURN)) {
-        await onMessage(message);
-        sent.push(message);
+    const deliver = async (bubbles: ParsedBubbles): Promise<string[]> => {
+        const delivered: string[] = [];
+        for (const message of bubbles.texts.slice(0, MAX_CHAT_MESSAGES_PER_TURN)) {
+            await onMessage(message);
+            delivered.push(message);
+        }
+        return delivered;
+    };
+
+    sent = await deliver(parsed);
+    if (sent.length > 0) {
+        path = 'json';
     }
 
-    let path: 'json' | 'text_fallback' | 'empty' = sent.length > 0 ? 'json' : 'empty';
-    // 解析失败（或 provider 不支持 JSON 模式）时，保留原始回复为单条气泡；
-    // 解析成功但 messages 为空时不发送任何内容。
+    // 解析失败（模型没按 JSON 返回）时，把原始回复作为单条气泡，至少不丢内容。
     if (sent.length === 0 && rawText && !parsed.valid) {
         await onMessage(rawText);
         sent.push(rawText);
         path = 'text_fallback';
     }
 
+    // JSON 模式偶尔会返回空 content 或空数组；此时再用普通请求重试一次。
+    // 普通请求仍可能按提示词返回 JSON 数组，因此继续解析；否则作为单条发送。
+    if (sent.length === 0 && usedJsonMode) {
+        emptyEnvelope = true;
+        fallbackUsed = true;
+        console.warn('[chat-delivery] empty JSON envelope; retrying without response_format');
+        result = await client.complete(baseOptions);
+        rawText = result.text.trim();
+        parsed = parseBubbleEnvelope(rawText);
+        activeParsed = parsed;
+        sent = await deliver(parsed);
+        if (sent.length > 0) {
+            path = 'json';
+        } else if (rawText && !parsed.valid) {
+            await onMessage(rawText);
+            sent.push(rawText);
+            path = 'text_fallback';
+        }
+    }
+
+    if (sent.length === 0) {
+        throw new Error('The model returned an empty reply');
+    }
+
     console.info('[chat-delivery]', {
         ...diagnostics,
         model: options.model,
         path,
-        format: usedJsonMode ? 'json_object' : 'text',
-        requested: parsed.texts.length,
+        format: fallbackUsed ? 'text_retry' : usedJsonMode ? 'json_object' : 'text',
+        fallbackUsed,
+        emptyEnvelope,
+        requested: activeParsed.texts.length,
         delivered: sent.length,
-        capHit,
-        invalidItems: parsed.invalidItems,
-        jsonParseFailed: !!rawText && !parsed.valid,
+        capHit: activeParsed.texts.length > MAX_CHAT_MESSAGES_PER_TURN,
+        invalidItems: activeParsed.invalidItems,
+        jsonParseFailed: !!rawText && !activeParsed.valid,
         hasReasoningContent: !!result.reasoningContent,
         finishReason: result.stopReason ?? null,
         durationMs: Date.now() - startedAt,

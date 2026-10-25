@@ -89,14 +89,42 @@ describe('completeWithMessageActions', () => {
         expect(sent).toEqual(['{"messages":["未闭合"']);
     });
 
-    it('sends nothing for a valid empty messages array', async () => {
-        const { client } = fakeClient([{ text: envelope([]) }]);
+    it('retries without response_format when JSON content is empty', async () => {
+        const { client, requests } = fakeClient([{ text: '' }, { text: '普通回复' }]);
         const sent: string[] = [];
 
-        const result = await completeWithMessageActions(client, options, async text => sent.push(text));
+        await completeWithMessageActions(client, options, async text => sent.push(text));
 
-        expect(sent).toEqual([]);
-        expect(result).toBe('');
+        expect(sent).toEqual(['普通回复']);
+        expect(requests).toHaveLength(2);
+        expect(requests[0].extra).toMatchObject({ response_format: { type: 'json_object' } });
+        expect((requests[1].extra as Record<string, unknown> | undefined)?.response_format).toBeUndefined();
+    });
+
+    it('uses a JSON array from the retry when JSON content is empty', async () => {
+        const { client } = fakeClient([{ text: '' }, { text: envelope(['一', '二']) }]);
+        const sent: string[] = [];
+
+        await completeWithMessageActions(client, options, async text => sent.push(text));
+
+        expect(sent).toEqual(['一', '二']);
+    });
+
+    it('retries when the JSON envelope contains an empty array', async () => {
+        const { client } = fakeClient([{ text: envelope([]) }, { text: '兜底回复' }]);
+        const sent: string[] = [];
+
+        await completeWithMessageActions(client, options, async text => sent.push(text));
+
+        expect(sent).toEqual(['兜底回复']);
+    });
+
+    it('rejects when both the JSON envelope and the retry are empty', async () => {
+        const { client } = fakeClient([{ text: '' }, { text: '' }]);
+
+        await expect(completeWithMessageActions(client, options, async () => {})).rejects.toThrow(
+            'empty reply',
+        );
     });
 
     it('drops empty and non-string items', async () => {
