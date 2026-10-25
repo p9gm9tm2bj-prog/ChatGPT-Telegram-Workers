@@ -801,7 +801,14 @@ async function run(): Promise<void> {
                 ],
             });
             llm.reset();
-            llm.setReply(JSON.stringify({ messages: ['第一条气泡', '第二条气泡', '第三条气泡'] }));
+            llm.setReply('');
+            llm.setToolCalls([
+                {
+                    id: 'call_1',
+                    name: 'send_messages',
+                    arguments: { messages: ['第一条气泡', '第二条气泡', '第三条气泡'] },
+                },
+            ]);
             telegram.reset();
             await botClient.sendUpdate(
                 textMessage({ chatId, userId: WHITELIST_USER, text: '多说几句' }),
@@ -809,8 +816,9 @@ async function run(): Promise<void> {
             );
 
             const request = llm.lastChatRequest();
-            s.expectEq('json response format requested', request?.response_format?.type, 'json_object');
-            s.expect('no tools advertised', request?.tools === undefined);
+            s.expectEq('send_messages tool advertised', request?.tools?.[0]?.function?.name, 'send_messages');
+            s.expectEq('required tool choice', request?.tool_choice, 'required');
+            s.expectEq('thinking disabled for forced tools', request?.thinking?.type, 'disabled');
 
             const bubbles = telegram.sentFor(chatId).filter(message => message.text !== '...');
             s.expectEq(
