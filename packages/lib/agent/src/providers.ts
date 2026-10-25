@@ -1,48 +1,22 @@
-import type {
-    ClientConfig,
-    CompletionOptions,
-    CompletionResult,
-    FunctionTool,
-    FunctionToolCall,
-} from '@chatgpt-telegram-workers/ai';
+import type { ClientConfig, CompletionOptions, CompletionResult } from '@chatgpt-telegram-workers/ai';
 import type { AppSettings, ChatProviderConfig, ImageProviderConfig } from '@chatgpt-telegram-workers/config';
 import type { ChatAgent, ImageAgent } from './types';
 import { createClient, createImageClient, findChatProtocol } from '@chatgpt-telegram-workers/ai';
 import { consumeTextStream } from './stream';
 
 const CHAT_MESSAGE_SYSTEM_PROMPT = [
-    'You are chatting on Telegram. Deliver every reply by calling send_messages.',
-    'Each item in messages is sent immediately as a separate Telegram bubble, in the order given.',
-    'A single item is a normal reply. Use several items only when your reply naturally consists of separate thoughts or chat lines.',
-    'Never split text mechanically, and never add filler just to create more bubbles.',
-    'Do not mention this sending mechanism to the user. Keep your configured persona, tone, and humor.',
+    'You are chatting on Telegram. Return a JSON object of the form {"messages":["..."]}.',
+    'Each string in messages is sent as one separate Telegram chat bubble, in order.',
+    'Use one string when one message is enough. Use several strings when your reply naturally consists of separate thoughts, reactions, or chat lines.',
+    'Do not mechanically split sentences and do not add filler just to make more bubbles.',
+    'Do not mention this JSON format. Keep your configured persona, tone, and humor.',
 ].join(' ');
 
-const SEND_MESSAGES_TOOL: FunctionTool = {
-    type: 'function',
-    function: {
-        name: 'send_messages',
-        description:
-            'Deliver your reply as Telegram chat bubbles. Each item in "messages" is sent immediately as a separate message, in order. Use one item for a normal single-message reply; use multiple items when you would naturally send separate chat lines. Do not mechanically split a paragraph.',
-        parameters: {
-            type: 'object',
-            properties: {
-                messages: {
-                    type: 'array',
-                    items: { type: 'string' },
-                    description: 'Message texts in send order. One item is a normal single-message reply.',
-                },
-            },
-            required: ['messages'],
-            additionalProperties: false,
-        },
-    },
-};
+/** DeepSeek thinking 模式不支持强制 tool_choice，用 JSON 信封承载 1..N 个气泡。 */
+const BUBBLE_RESPONSE_FORMAT = { type: 'json_object' } as const;
 
 // The model chooses how many messages to send; this is only a hard safety cap.
 const MAX_CHAT_MESSAGES_PER_TURN = 10;
-
-type MessageToolChoice = 'auto' | 'required';
 
 /** 仅用于诊断：人设是否明确要求只发一条，避免和发送协议互相打架。 */
 function personaMentionsSingleMessage(persona: string): boolean {
@@ -54,53 +28,51 @@ export interface MessageActionDiagnostics {
     personaMentionsSingleMessage?: boolean;
 }
 
-interface ParsedMessageActions {
+interface ParsedBubbles {
     texts: string[];
-    toolNames: string[];
     invalidItems: number;
+    /** JSON 解析成功且 messages 是数组（空数组也算有效）。 */
+    valid: boolean;
 }
 
-function parseMessageActions(toolCalls: FunctionToolCall[]): ParsedMessageActions {
-    const texts: string[] = [];
-    const toolNames: string[] = [];
-    let invalidItems = 0;
+export function parseBubbleEnvelope(text: string): ParsedBubbles {
+    let normalized = text.trim();
+    const fenced = normalized.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+    if (fenced) {
+        normalized = fenced[1].trim();
+    }
 
-    for (const call of toolCalls) {
-        toolNames.push(call.function.name);
-        if (call.function.name !== 'send_messages') {
+    let data: unknown;
+    try {
+        data = JSON.parse(normalized);
+    } catch {
+        return { texts: [], invalidItems: 1, valid: false };
+    }
+
+    const list = (data as { messages?: unknown })?.messages;
+    if (!Array.isArray(list)) {
+        return { texts: [], invalidItems: 1, valid: false };
+    }
+
+    const texts: string[] = [];
+    let invalidItems = 0;
+    for (const item of list) {
+        if (typeof item !== 'string') {
+            invalidItems++;
             continue;
         }
-        try {
-            const args =
-                typeof call.function.arguments === 'string'
-                    ? JSON.parse(call.function.arguments)
-                    : call.function.arguments;
-            const list = (args as { messages?: unknown })?.messages;
-            if (!Array.isArray(list)) {
-                invalidItems++;
-                continue;
-            }
-            for (const item of list) {
-                if (typeof item !== 'string') {
-                    invalidItems++;
-                    continue;
-                }
-                const text = item.trim();
-                if (text) {
-                    texts.push(text);
-                }
-            }
-        } catch {
-            invalidItems++;
+        const value = item.trim();
+        if (value) {
+            texts.push(value);
         }
     }
 
-    return { texts, toolNames, invalidItems };
+    return { texts, invalidItems, valid: true };
 }
 
 /**
- * 一轮对话只请求一次模型，由模型把 1..N 条消息写进 send_messages 数组。
- * 强制的是发送通道，不是条数；没有任何机械拆分。
+ * 一轮对话只请求一次模型，由模型把 1..N 条消息写进 JSON 的 messages 数组。
+ * 约束的是输出信封，不是条数；没有任何机械拆分。
  */
 export async function completeWithMessageActions(
     client: ReturnType<typeof createClient>,
@@ -109,60 +81,46 @@ export async function completeWithMessageActions(
     diagnostics: MessageActionDiagnostics = {},
 ): Promise<string> {
     const startedAt = Date.now();
-    const requestOptions: CompletionOptions = {
-        ...options,
-        messages: [...options.messages],
-        tools: [SEND_MESSAGES_TOOL],
+    const messages = [...options.messages];
+    const baseOptions: CompletionOptions = { ...options, messages };
+    const jsonOptions: CompletionOptions = {
+        ...baseOptions,
+        extra: { ...(options.extra ?? {}), response_format: BUBBLE_RESPONSE_FORMAT },
     };
 
-    let toolChoice: MessageToolChoice = 'required';
-    let retriedWithAuto = false;
     let result: CompletionResult;
+    let usedJsonMode = true;
     try {
-        result = await client.complete({ ...requestOptions, toolChoice });
+        result = await client.complete(jsonOptions);
     } catch (error) {
-        // 超时/主动中断不重试；其它错误可能是 provider 不支持 required，退回 auto 一次。
-        // 此时还没有发送任何消息，重试不会造成重复气泡。
         if ((error as Error)?.name === 'AbortError') {
             throw error;
         }
-        console.warn('[chat-delivery] tool_choice=required failed; retrying with auto', {
+        // 少数 chat-completions provider 不支持 response_format；退回普通请求，
+        // 并把整段回复作为单条消息发送，至少不丢内容。
+        console.warn('[chat-delivery] json_object response failed; retrying without response_format', {
             errorName: (error as Error)?.name,
         });
-        toolChoice = 'auto';
-        retriedWithAuto = true;
-        result = await client.complete({ ...requestOptions, toolChoice });
+        usedJsonMode = false;
+        result = await client.complete(baseOptions);
     }
 
-    const toolCalls = result.toolCalls ?? [];
-    const text = result.text.trim();
+    const rawText = result.text.trim();
+    const parsed = parseBubbleEnvelope(rawText);
+    const capHit = parsed.texts.length > MAX_CHAT_MESSAGES_PER_TURN;
     const sent: string[] = [];
-    let path: 'tools' | 'text_fallback' | 'empty' = 'empty';
-    let toolNames: string[] = [];
-    let requested = 0;
-    let capHit = false;
-    let invalidItems = 0;
 
-    if (toolCalls.length > 0) {
-        const parsed = parseMessageActions(toolCalls);
-        toolNames = parsed.toolNames;
-        requested = parsed.texts.length;
-        invalidItems = parsed.invalidItems;
-        capHit = parsed.texts.length > MAX_CHAT_MESSAGES_PER_TURN;
-
-        for (const message of parsed.texts.slice(0, MAX_CHAT_MESSAGES_PER_TURN)) {
-            await onMessage(message);
-            sent.push(message);
-        }
-        if (sent.length > 0) {
-            path = 'tools';
-        }
+    for (const message of parsed.texts.slice(0, MAX_CHAT_MESSAGES_PER_TURN)) {
+        await onMessage(message);
+        sent.push(message);
     }
 
-    // 工具调用没有产出有效内容时，把模型的普通文本作为单条消息发送，保证不丢回复。
-    if (sent.length === 0 && text) {
-        await onMessage(text);
-        sent.push(text);
+    let path: 'json' | 'text_fallback' | 'empty' = sent.length > 0 ? 'json' : 'empty';
+    // 解析失败（或 provider 不支持 JSON 模式）时，保留原始回复为单条气泡；
+    // 解析成功但 messages 为空时不发送任何内容。
+    if (sent.length === 0 && rawText && !parsed.valid) {
+        await onMessage(rawText);
+        sent.push(rawText);
         path = 'text_fallback';
     }
 
@@ -170,14 +128,12 @@ export async function completeWithMessageActions(
         ...diagnostics,
         model: options.model,
         path,
-        toolChoice,
-        retriedWithAuto,
-        toolNames,
-        requested,
+        format: usedJsonMode ? 'json_object' : 'text',
+        requested: parsed.texts.length,
         delivered: sent.length,
         capHit,
-        invalidItems,
-        contentAlongsideTools: toolCalls.length > 0 && !!text,
+        invalidItems: parsed.invalidItems,
+        jsonParseFailed: !!rawText && !parsed.valid,
         hasReasoningContent: !!result.reasoningContent,
         finishReason: result.stopReason ?? null,
         durationMs: Date.now() - startedAt,

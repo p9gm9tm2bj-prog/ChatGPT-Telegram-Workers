@@ -1,21 +1,5 @@
-import type { CompletionOptions, CompletionResult, FunctionToolCall, LLMClient } from '@chatgpt-telegram-workers/ai';
+import type { CompletionOptions, CompletionResult, LLMClient } from '@chatgpt-telegram-workers/ai';
 import { completeWithMessageActions } from './providers';
-
-function toolCall(id: string, messages: string[]): FunctionToolCall {
-    return {
-        id,
-        type: 'function',
-        function: { name: 'send_messages', arguments: JSON.stringify({ messages }) },
-    };
-}
-
-function rawToolCall(id: string, name: string, args: unknown): FunctionToolCall {
-    return {
-        id,
-        type: 'function',
-        function: { name, arguments: typeof args === 'string' ? args : JSON.stringify(args) },
-    };
-}
 
 function fakeClient(results: CompletionResult[], firstError?: Error) {
     const requests: CompletionOptions[] = [];
@@ -35,11 +19,15 @@ function fakeClient(results: CompletionResult[], firstError?: Error) {
     return { client, requests };
 }
 
+function envelope(messages: string[]): string {
+    return JSON.stringify({ messages });
+}
+
 const options: CompletionOptions = { model: 'deepseek-flash', messages: [{ role: 'user', content: '在干嘛' }] };
 
 describe('completeWithMessageActions', () => {
-    it('sends a single model-selected bubble through the required tool', async () => {
-        const { client, requests } = fakeClient([{ text: '', toolCalls: [toolCall('call_1', ['好呀，等我一下'])] }]);
+    it('sends a single model-selected bubble from the JSON envelope', async () => {
+        const { client, requests } = fakeClient([{ text: envelope(['好呀，等我一下']) }]);
         const sent: string[] = [];
 
         const result = await completeWithMessageActions(client, options, async text => sent.push(text));
@@ -47,13 +35,13 @@ describe('completeWithMessageActions', () => {
         expect(sent).toEqual(['好呀，等我一下']);
         expect(result).toBe('好呀，等我一下');
         expect(requests).toHaveLength(1);
-        expect(requests[0].toolChoice).toBe('required');
-        expect(requests[0].tools?.[0].function.name).toBe('send_messages');
+        expect(requests[0].tools).toBeUndefined();
+        expect(requests[0].extra).toMatchObject({ response_format: { type: 'json_object' } });
     });
 
     it('keeps the model-selected order of several bubbles', async () => {
         const { client, requests } = fakeClient([
-            { text: '', toolCalls: [toolCall('call_1', ['哟，来啦？', '我刚准备找点东西吃', '你吃饭了没？'])] },
+            { text: envelope(['哟，来啦？', '我刚准备找点东西吃', '你吃饭了没？']) },
         ]);
         const sent: string[] = [];
 
@@ -64,77 +52,55 @@ describe('completeWithMessageActions', () => {
         expect(requests).toHaveLength(1);
     });
 
-    it('caps the turn at ten messages without dropping content beyond the cap', async () => {
+    it('caps the turn at ten messages', async () => {
         const messages = Array.from({ length: 12 }, (_, index) => `第${index + 1}条`);
-        const { client, requests } = fakeClient([{ text: '', toolCalls: [toolCall('call_1', messages)] }]);
+        const { client } = fakeClient([{ text: envelope(messages) }]);
         const sent: string[] = [];
 
         await completeWithMessageActions(client, options, async text => sent.push(text));
 
         expect(sent).toEqual(messages.slice(0, 10));
-        expect(requests).toHaveLength(1);
     });
 
-    it('falls back to one plain-text bubble when the model does not call the tool', async () => {
-        const { client, requests } = fakeClient([{ text: '好呀，等我一下。' }]);
+    it('parses JSON wrapped in a code fence', async () => {
+        const { client } = fakeClient([{ text: '```json\n{"messages":["一","二"]}\n```' }]);
+        const sent: string[] = [];
+
+        await completeWithMessageActions(client, options, async text => sent.push(text));
+
+        expect(sent).toEqual(['一', '二']);
+    });
+
+    it('falls back to one plain-text bubble when the model ignores the JSON envelope', async () => {
+        const { client } = fakeClient([{ text: '好呀，等我一下。' }]);
         const sent: string[] = [];
 
         await completeWithMessageActions(client, options, async text => sent.push(text));
 
         expect(sent).toEqual(['好呀，等我一下。']);
-        expect(requests).toHaveLength(1);
     });
 
-    it('retries with auto when the provider rejects a required tool choice', async () => {
-        const { client, requests } = fakeClient(
-            [{ text: '', toolCalls: [toolCall('call_1', ['好呀'])] }],
-            new Error('tool_choice is not supported'),
-        );
+    it('preserves invalid JSON as one bubble instead of dropping it', async () => {
+        const { client } = fakeClient([{ text: '{"messages":["未闭合"' }]);
         const sent: string[] = [];
 
         await completeWithMessageActions(client, options, async text => sent.push(text));
 
-        expect(sent).toEqual(['好呀']);
-        expect(requests).toHaveLength(2);
-        expect(requests[0].toolChoice).toBe('required');
-        expect(requests[1].toolChoice).toBe('auto');
+        expect(sent).toEqual(['{"messages":["未闭合"']);
     });
 
-    it('does not send assistant text alongside tool calls', async () => {
-        const { client } = fakeClient([
-            { text: '好的，我来发送。', toolCalls: [toolCall('call_1', ['哟，来啦？'])] },
-        ]);
+    it('sends nothing for a valid empty messages array', async () => {
+        const { client } = fakeClient([{ text: envelope([]) }]);
         const sent: string[] = [];
 
-        await completeWithMessageActions(client, options, async text => sent.push(text));
+        const result = await completeWithMessageActions(client, options, async text => sent.push(text));
 
-        expect(sent).toEqual(['哟，来啦？']);
+        expect(sent).toEqual([]);
+        expect(result).toBe('');
     });
 
-    it('flattens multiple tool calls in order', async () => {
-        const { client } = fakeClient([
-            {
-                text: '',
-                toolCalls: [toolCall('call_1', ['一', '二']), toolCall('call_2', ['三'])],
-            },
-        ]);
-        const sent: string[] = [];
-
-        await completeWithMessageActions(client, options, async text => sent.push(text));
-
-        expect(sent).toEqual(['一', '二', '三']);
-    });
-
-    it('drops empty items and ignores unknown tools', async () => {
-        const { client } = fakeClient([
-            {
-                text: '',
-                toolCalls: [
-                    rawToolCall('call_1', 'send_messages', { messages: ['', '  ', '有效'] }),
-                    rawToolCall('call_2', 'do_something_else', {}),
-                ],
-            },
-        ]);
+    it('drops empty and non-string items', async () => {
+        const { client } = fakeClient([{ text: JSON.stringify({ messages: ['', '  ', 42, '有效'] }) }]);
         const sent: string[] = [];
 
         await completeWithMessageActions(client, options, async text => sent.push(text));
@@ -142,27 +108,23 @@ describe('completeWithMessageActions', () => {
         expect(sent).toEqual(['有效']);
     });
 
-    it('falls back to plain text when tool arguments are invalid', async () => {
-        const { client } = fakeClient([
-            {
-                text: '兜底回复',
-                toolCalls: [rawToolCall('call_1', 'send_messages', 'not-json')],
-            },
-        ]);
+    it('retries without response_format and sends the reply as one bubble', async () => {
+        const { client, requests } = fakeClient([{ text: '普通文本兜底' }], new Error('response_format unsupported'));
         const sent: string[] = [];
 
         await completeWithMessageActions(client, options, async text => sent.push(text));
 
-        expect(sent).toEqual(['兜底回复']);
+        expect(sent).toEqual(['普通文本兜底']);
+        expect(requests).toHaveLength(2);
+        expect(requests[0].extra).toMatchObject({ response_format: { type: 'json_object' } });
+        expect((requests[1].extra as Record<string, unknown> | undefined)?.response_format).toBeUndefined();
     });
 
-    it('returns an empty result when the model produces neither text nor usable tool calls', async () => {
-        const { client } = fakeClient([{ text: '' }]);
-        const sent: string[] = [];
+    it('does not retry an aborted request', async () => {
+        const abort = Object.assign(new Error('aborted'), { name: 'AbortError' });
+        const { client, requests } = fakeClient([], abort);
 
-        const result = await completeWithMessageActions(client, options, async text => sent.push(text));
-
-        expect(sent).toEqual([]);
-        expect(result).toBe('');
+        await expect(completeWithMessageActions(client, options, async () => {})).rejects.toBe(abort);
+        expect(requests).toHaveLength(1);
     });
 });
