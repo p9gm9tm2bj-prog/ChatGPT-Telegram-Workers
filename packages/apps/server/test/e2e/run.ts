@@ -790,33 +790,67 @@ async function run(): Promise<void> {
             s.finish();
         }
 
-        // ------------------------------------------ 12. streaming into chat bubbles
+        // ------------------------------------------ 12. model-selected chat bubbles
         {
-            const s = new Scenario('streaming');
+            const s = new Scenario('multi-bubble delivery');
             const chatId = WHITELIST_USER;
             await harness.applyConfig({
-                settings: { allowedUserIds: [`${WHITELIST_USER}`], streamMode: true, telegramMinStreamInterval: 0 },
+                settings: { allowedUserIds: [`${WHITELIST_USER}`], streamMode: false },
                 chatProviders: [
                     { id: 'mock-chat', baseUrl: `${llmUrl}/v1`, model: 'mock-model', models: ['mock-model'] },
                 ],
             });
-            llm.setStream({ chunks: ['Hello from the stream!', '\n\n', 'A second bubble.'], delayMs: 0 });
+            llm.reset();
+            llm.setReply('');
+            llm.setToolCalls([
+                {
+                    id: 'call_1',
+                    name: 'send_messages',
+                    arguments: { messages: ['第一条气泡', '第二条气泡', '第三条气泡'] },
+                },
+            ]);
             telegram.reset();
             await botClient.sendUpdate(
-                textMessage({ chatId, userId: WHITELIST_USER, text: 'stream please' }),
+                textMessage({ chatId, userId: WHITELIST_USER, text: '多说几句' }),
                 SECRET_TOKEN,
             );
-            const texts = telegram.textsFor(chatId);
-            s.expect(
-                'completed stream is split into two bubbles',
-                texts.includes('Hello from the stream!') && texts.includes('A second bubble.'),
-                JSON.stringify(texts),
+
+            const request = llm.lastChatRequest();
+            s.expectEq('send_messages tool advertised', request?.tools?.[0]?.function?.name, 'send_messages');
+            s.expectEq('required tool choice', request?.tool_choice, 'required');
+
+            const bubbles = telegram.sentFor(chatId).filter(message => message.text !== '...');
+            s.expectEq(
+                'model-selected bubbles sent in order',
+                bubbles.map(message => message.text),
+                ['第一条气泡', '第二条气泡', '第三条气泡'],
             );
-            s.expect(
-                'stream is not leaked as repeated edits',
-                telegram.callsFor('editMessageText').length === 1,
-                `edit count: ${telegram.callsFor('editMessageText').length}`,
+            s.expectEq('first bubble edits the placeholder', bubbles[0]?.via, 'editMessageText');
+            s.expectEq(
+                'remaining bubbles are new messages',
+                bubbles.slice(1).map(message => message.via),
+                ['sendMessage', 'sendMessage'],
             );
+            s.finish();
+        }
+
+        // ------------------------------------------ 12b. plain text stays a single bubble
+        {
+            const s = new Scenario('single-message fallback');
+            const chatId = WHITELIST_USER;
+            await harness.applyConfig({
+                settings: { allowedUserIds: [`${WHITELIST_USER}`], streamMode: false },
+            });
+            llm.reset();
+            llm.setReply('单条兜底回复');
+            telegram.reset();
+            await botClient.sendUpdate(
+                textMessage({ chatId, userId: WHITELIST_USER, text: '只回一句' }),
+                SECRET_TOKEN,
+            );
+            const bubbles = telegram.sentFor(chatId).filter(message => message.text !== '...');
+            s.expectEq('plain text is one bubble', bubbles.map(message => message.text), ['单条兜底回复']);
+            s.expectEq('plain text edits the placeholder', bubbles[0]?.via, 'editMessageText');
             s.finish();
         }
     } finally {
@@ -845,4 +879,3 @@ run()
         console.error(e);
         process.exit(1);
     });
-

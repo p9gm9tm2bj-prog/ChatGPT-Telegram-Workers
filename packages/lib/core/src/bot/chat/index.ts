@@ -36,8 +36,22 @@ export async function chatWithMessage(
         // Other providers keep their existing single-response behavior.
         const onStream: StreamHandler | null = ENV.CONFIG.settings.streamMode ? async () => {} : null;
         let sentByAgent = 0;
+        const retryAfterSeconds = async (response: Response): Promise<number> => {
+            try {
+                const body = (await response.clone().json()) as { parameters?: { retry_after?: number } };
+                return Math.min(body.parameters?.retry_after ?? 1, 5);
+            } catch {
+                return 1;
+            }
+        };
         const onMessage = async (text: string) => {
-            const response = await sender.sendRichText(text);
+            let response = await sender.sendRichText(text);
+            // 连续气泡很容易触发 Telegram 限流；只对未拆分的单条消息重试一次。
+            if (!response.ok && response.status === 429 && text.length <= 4096) {
+                const delayMs = (await retryAfterSeconds(response)) * 1000;
+                await new Promise(resolve => setTimeout(resolve, delayMs));
+                response = await sender.sendRichText(text);
+            }
             if (!response.ok) {
                 throw new Error(`Telegram message send failed (${response.status})`);
             }

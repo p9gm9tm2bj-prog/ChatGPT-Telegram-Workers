@@ -1,3 +1,7 @@
+/**
+ * @deprecated 仅覆盖未使用的机械分段实现；真实多气泡由 agent 的
+ * send_messages 工具驱动，见 packages/lib/agent/src/providers.ts。
+ */
 import { describe, expect, it } from 'vitest';
 import { splitAssistantBubbles } from './bubbles';
 
@@ -23,4 +27,3 @@ describe('splitAssistantBubbles', () => {
         expect(splitAssistantBubbles('一\n\n二\n\n三\n\n四')).toEqual(['一', '二', '三\n\n四']);
     });
 });
-

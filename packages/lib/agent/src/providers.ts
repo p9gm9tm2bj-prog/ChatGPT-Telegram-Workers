@@ -1,23 +1,39 @@
-import type { ClientConfig, CompletionOptions, FunctionTool, Message } from '@chatgpt-telegram-workers/ai';
+import type {
+    ClientConfig,
+    CompletionOptions,
+    CompletionResult,
+    FunctionTool,
+    FunctionToolCall,
+} from '@chatgpt-telegram-workers/ai';
 import type { AppSettings, ChatProviderConfig, ImageProviderConfig } from '@chatgpt-telegram-workers/config';
 import type { ChatAgent, ImageAgent } from './types';
 import { createClient, createImageClient, findChatProtocol } from '@chatgpt-telegram-workers/ai';
 import { consumeTextStream } from './stream';
 
 const CHAT_MESSAGE_SYSTEM_PROMPT = [
-    'For natural Telegram conversation, you may send one or multiple separate messages with send_message, or answer normally in one message.',
-    'Choose the content and number of messages naturally. Do not force a particular count or change your configured persona.',
+    'You are chatting on Telegram. Deliver every reply by calling send_messages.',
+    'Each item in messages is sent immediately as a separate Telegram bubble, in the order given.',
+    'A single item is a normal reply. Use several items only when your reply naturally consists of separate thoughts or chat lines.',
+    'Never split text mechanically, and never add filler just to create more bubbles.',
+    'Do not mention this sending mechanism to the user. Keep your configured persona, tone, and humor.',
 ].join(' ');
 
-const SEND_MESSAGE_TOOL: FunctionTool = {
+const SEND_MESSAGES_TOOL: FunctionTool = {
     type: 'function',
     function: {
-        name: 'send_message',
-        description: 'Send this message to the user as a separate Telegram chat bubble.',
+        name: 'send_messages',
+        description:
+            'Deliver your reply as Telegram chat bubbles. Each item in "messages" is sent immediately as a separate message, in order. Use one item for a normal single-message reply; use multiple items when you would naturally send separate chat lines. Do not mechanically split a paragraph.',
         parameters: {
             type: 'object',
-            properties: { text: { type: 'string', description: 'The exact text of one Telegram message.' } },
-            required: ['text'],
+            properties: {
+                messages: {
+                    type: 'array',
+                    items: { type: 'string' },
+                    description: 'Message texts in send order. One item is a normal single-message reply.',
+                },
+            },
+            required: ['messages'],
             additionalProperties: false,
         },
     },
@@ -26,96 +42,148 @@ const SEND_MESSAGE_TOOL: FunctionTool = {
 // The model chooses how many messages to send; this is only a hard safety cap.
 const MAX_CHAT_MESSAGES_PER_TURN = 10;
 
+type MessageToolChoice = 'auto' | 'required';
+
+/** 仅用于诊断：人设是否明确要求只发一条，避免和发送协议互相打架。 */
+function personaMentionsSingleMessage(persona: string): boolean {
+    return /(one message|single message|one reply|single reply|一条|单条|一句话)/i.test(persona);
+}
+
+export interface MessageActionDiagnostics {
+    hasPersona?: boolean;
+    personaMentionsSingleMessage?: boolean;
+}
+
+interface ParsedMessageActions {
+    texts: string[];
+    toolNames: string[];
+    invalidItems: number;
+}
+
+function parseMessageActions(toolCalls: FunctionToolCall[]): ParsedMessageActions {
+    const texts: string[] = [];
+    const toolNames: string[] = [];
+    let invalidItems = 0;
+
+    for (const call of toolCalls) {
+        toolNames.push(call.function.name);
+        if (call.function.name !== 'send_messages') {
+            continue;
+        }
+        try {
+            const args =
+                typeof call.function.arguments === 'string'
+                    ? JSON.parse(call.function.arguments)
+                    : call.function.arguments;
+            const list = (args as { messages?: unknown })?.messages;
+            if (!Array.isArray(list)) {
+                invalidItems++;
+                continue;
+            }
+            for (const item of list) {
+                if (typeof item !== 'string') {
+                    invalidItems++;
+                    continue;
+                }
+                const text = item.trim();
+                if (text) {
+                    texts.push(text);
+                }
+            }
+        } catch {
+            invalidItems++;
+        }
+    }
+
+    return { texts, toolNames, invalidItems };
+}
+
+/**
+ * 一轮对话只请求一次模型，由模型把 1..N 条消息写进 send_messages 数组。
+ * 强制的是发送通道，不是条数；没有任何机械拆分。
+ */
 export async function completeWithMessageActions(
     client: ReturnType<typeof createClient>,
     options: CompletionOptions,
     onMessage: (text: string) => Promise<unknown>,
+    diagnostics: MessageActionDiagnostics = {},
 ): Promise<string> {
-    const messages = [...options.messages];
-    const delivered: string[] = [];
+    const startedAt = Date.now();
+    const requestOptions: CompletionOptions = {
+        ...options,
+        messages: [...options.messages],
+        tools: [SEND_MESSAGES_TOOL],
+    };
 
-    while (true) {
-            if (delivered.length >= MAX_CHAT_MESSAGES_PER_TURN) {
-                return delivered.join('\n\n');
-            }
-            let result;
-            try {
-                result = await client.complete({
-                    ...options,
-                    messages,
-                    tools: [SEND_MESSAGE_TOOL],
-                    toolChoice: 'auto',
-                });
-            } catch (error) {
-                if (delivered.length === 0) {
-                    throw error;
-                }
-                console.error('Stopping message-action turn after a provider error:', error);
-                return delivered.join('\n\n');
-            }
-            const text = result.text.trim();
-            const toolCalls = result.toolCalls ?? [];
-            console.info('[chat-message-diagnostic]', {
-                decision: toolCalls.length > 0 ? 'tool_calls' : 'final_text',
-                toolCalls: toolCalls.map(call => call.function.name),
-                deliveredCount: delivered.length,
-            });
-
-            // No action call means the model chose to finish this turn naturally.
-            if (toolCalls.length === 0) {
-                if (text) {
-                    await onMessage(text);
-                    delivered.push(text);
-                }
-                return delivered.join('\n\n');
-            }
-
-            const assistantMessage: Message = {
-                role: 'assistant',
-                content: result.text,
-                tool_calls: toolCalls,
-                ...(result.reasoningContent ? { reasoning_content: result.reasoningContent } : {}),
-            };
-            messages.push(assistantMessage);
-            if (text) {
-                await onMessage(text);
-                delivered.push(text);
-                if (delivered.length >= MAX_CHAT_MESSAGES_PER_TURN) {
-                    return delivered.join('\n\n');
-                }
-            }
-
-            for (const toolCall of toolCalls) {
-                let toolResult = 'No message was sent.';
-                if (toolCall.function.name === 'send_message') {
-                    try {
-                        const args = JSON.parse(toolCall.function.arguments) as { text?: unknown };
-                        const messageText = typeof args.text === 'string' ? args.text.trim() : '';
-                        if (messageText && delivered.length < MAX_CHAT_MESSAGES_PER_TURN) {
-                            await onMessage(messageText);
-                            delivered.push(messageText);
-                            toolResult = 'Message sent successfully.';
-                        } else if (delivered.length >= MAX_CHAT_MESSAGES_PER_TURN) {
-                            toolResult = 'Message not sent: the ten-message safety cap was reached.';
-                        } else {
-                            toolResult = 'The message was empty and was not sent.';
-                        }
-                    } catch (error) {
-                        if (error instanceof SyntaxError) {
-                            toolResult = 'Invalid message arguments; no message was sent.';
-                        } else {
-                            throw error;
-                        }
-                    }
-                } else {
-                    toolResult = 'Unknown action; no message was sent.';
-                }
-                messages.push({ role: 'tool', tool_call_id: toolCall.id, content: toolResult });
-                if (delivered.length >= MAX_CHAT_MESSAGES_PER_TURN) {
-                    return delivered.join('\n\n');
-                }
-            }
+    let toolChoice: MessageToolChoice = 'required';
+    let retriedWithAuto = false;
+    let result: CompletionResult;
+    try {
+        result = await client.complete({ ...requestOptions, toolChoice });
+    } catch (error) {
+        // 超时/主动中断不重试；其它错误可能是 provider 不支持 required，退回 auto 一次。
+        // 此时还没有发送任何消息，重试不会造成重复气泡。
+        if ((error as Error)?.name === 'AbortError') {
+            throw error;
+        }
+        console.warn('[chat-delivery] tool_choice=required failed; retrying with auto', {
+            errorName: (error as Error)?.name,
+        });
+        toolChoice = 'auto';
+        retriedWithAuto = true;
+        result = await client.complete({ ...requestOptions, toolChoice });
     }
+
+    const toolCalls = result.toolCalls ?? [];
+    const text = result.text.trim();
+    const sent: string[] = [];
+    let path: 'tools' | 'text_fallback' | 'empty' = 'empty';
+    let toolNames: string[] = [];
+    let requested = 0;
+    let capHit = false;
+    let invalidItems = 0;
+
+    if (toolCalls.length > 0) {
+        const parsed = parseMessageActions(toolCalls);
+        toolNames = parsed.toolNames;
+        requested = parsed.texts.length;
+        invalidItems = parsed.invalidItems;
+        capHit = parsed.texts.length > MAX_CHAT_MESSAGES_PER_TURN;
+
+        for (const message of parsed.texts.slice(0, MAX_CHAT_MESSAGES_PER_TURN)) {
+            await onMessage(message);
+            sent.push(message);
+        }
+        if (sent.length > 0) {
+            path = 'tools';
+        }
+    }
+
+    // 工具调用没有产出有效内容时，把模型的普通文本作为单条消息发送，保证不丢回复。
+    if (sent.length === 0 && text) {
+        await onMessage(text);
+        sent.push(text);
+        path = 'text_fallback';
+    }
+
+    console.info('[chat-delivery]', {
+        ...diagnostics,
+        model: options.model,
+        path,
+        toolChoice,
+        retriedWithAuto,
+        toolNames,
+        requested,
+        delivered: sent.length,
+        capHit,
+        invalidItems,
+        contentAlongsideTools: toolCalls.length > 0 && !!text,
+        hasReasoningContent: !!result.reasoningContent,
+        finishReason: result.stopReason ?? null,
+        durationMs: Date.now() - startedAt,
+    });
+
+    return sent.join('\n\n');
 }
 
 /** 走 HTTP 客户端的聊天协议(workers 有独立入口) */
@@ -178,7 +246,11 @@ export function createChatAgent(
             };
             try {
                 if (protocol === 'chat-completions' && onMessage) {
-                    return await completeWithMessageActions(client, options, onMessage);
+                    const persona = settings.systemInitMessage ?? '';
+                    return await completeWithMessageActions(client, options, onMessage, {
+                        hasPersona: !!persona,
+                        personaMentionsSingleMessage: personaMentionsSingleMessage(persona),
+                    });
                 }
                 if (onStream) {
                     return await consumeTextStream(

@@ -20,6 +20,22 @@ describe('LLMMock chat completions', () => {
         expect(mock.lastChatRequest().messages[0].content).toBe('ping');
     });
 
+    it('returns configured tool calls with finish_reason tool_calls', async () => {
+        const mock = new LLMMock({ reply: '' });
+        mock.setToolCalls([
+            { id: 'call_1', name: 'send_messages', arguments: { messages: ['第一条', '第二条'] } },
+        ]);
+        const response = await post(mock, '/chat/completions', { model: 'm', messages: [] });
+        const data = await response.json();
+        expect(data.choices[0].finish_reason).toBe('tool_calls');
+        expect(data.choices[0].message.content).toBeNull();
+        expect(data.choices[0].message.tool_calls[0].id).toBe('call_1');
+        expect(data.choices[0].message.tool_calls[0].function.name).toBe('send_messages');
+        expect(JSON.parse(data.choices[0].message.tool_calls[0].function.arguments)).toEqual({
+            messages: ['第一条', '第二条'],
+        });
+    });
+
     it('streams chunks then [DONE] when stream is set', async () => {
         const mock = new LLMMock({ reply: 'streamed answer' });
         mock.setStream({ delayMs: 0 });

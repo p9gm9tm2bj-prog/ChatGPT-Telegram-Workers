@@ -1,4 +1,8 @@
 /**
+ * @deprecated 未使用的机械分段实现。多气泡现在由模型的 send_messages 工具
+ * 选择（见 `@chatgpt-telegram-workers/agent` 的 providers.ts），这里不再参与
+ * 发送流程。保留仅作参考，请勿重新接回聊天路径。
+ *
  * Conversational paragraphs are delivered as separate Telegram bubbles.
  * Keep structured/Markdown-heavy answers intact to avoid breaking formatting.
  */
@@ -30,4 +34,3 @@ export function splitAssistantBubbles(answer: string): string[] {
 }
 
 export const ASSISTANT_BUBBLE_DELAY_MS = 450;
-

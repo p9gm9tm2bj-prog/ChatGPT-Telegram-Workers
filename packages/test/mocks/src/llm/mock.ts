@@ -7,6 +7,16 @@ export interface LLMMockOptions {
     models?: string[];
     /** 图片生成返回的 URL */
     imageUrl?: string;
+    /** 非流式响应里返回的 tool calls */
+    toolCalls?: LLMToolCallPlan[];
+}
+
+/** mock 返回的单个 function tool call */
+export interface LLMToolCallPlan {
+    id?: string;
+    name: string;
+    /** 对象会自动 JSON 序列化；字符串按原样返回 */
+    arguments: unknown;
 }
 
 /** 单个分块的流式配置 */
@@ -33,12 +43,14 @@ export class LLMMock {
     private modelList: string[];
     private imageUrlValue: string;
     private streamPlan: StreamPlan = {};
+    private toolCalls: LLMToolCallPlan[] | null = null;
     private failStatus: { status: number; body: unknown; remaining: number } | null = null;
 
     constructor(options: LLMMockOptions = {}) {
         this.replyText = options.reply ?? 'Hello from the mock LLM!';
         this.modelList = options.models ?? ['mock-model', 'mock-model-2'];
         this.imageUrlValue = options.imageUrl ?? 'https://example.com/mock-image.png';
+        this.toolCalls = options.toolCalls ?? null;
     }
 
     setReply(text: string): void {
@@ -52,6 +64,11 @@ export class LLMMock {
     /** 配置下一次流式响应;`chunks` 缺省时按 reply 文本切分 */
     setStream(plan: StreamPlan): void {
         this.streamPlan = plan;
+    }
+
+    /** 让非流式响应返回 tool calls；传空数组或 null 恢复普通文本回复 */
+    setToolCalls(toolCalls: LLMToolCallPlan[] | null): void {
+        this.toolCalls = toolCalls?.length ? toolCalls : null;
     }
 
     /** 下一次请求返回指定错误(非 2xx),模拟 429 / 500 / 200+error */
@@ -78,6 +95,7 @@ export class LLMMock {
     reset(): void {
         this.recorded.length = 0;
         this.streamPlan = {};
+        this.toolCalls = null;
         this.failStatus = null;
     }
 
@@ -104,6 +122,7 @@ export class LLMMock {
             if (body?.stream) {
                 return this.streamCompletion(body);
             }
+            const toolCalls = this.toolCalls;
             return json({
                 id: 'chatcmpl-mock',
                 object: 'chat.completion',
@@ -111,8 +130,26 @@ export class LLMMock {
                 choices: [
                     {
                         index: 0,
-                        message: { role: 'assistant', content: this.replyText },
-                        finish_reason: 'stop',
+                        message: {
+                            role: 'assistant',
+                            content: toolCalls ? this.replyText || null : this.replyText,
+                            ...(toolCalls
+                                ? {
+                                      tool_calls: toolCalls.map((call, index) => ({
+                                          id: call.id ?? `call_mock_${index + 1}`,
+                                          type: 'function',
+                                          function: {
+                                              name: call.name,
+                                              arguments:
+                                                  typeof call.arguments === 'string'
+                                                      ? call.arguments
+                                                      : JSON.stringify(call.arguments),
+                                          },
+                                      })),
+                                  }
+                                : {}),
+                        },
+                        finish_reason: toolCalls ? 'tool_calls' : 'stop',
                     },
                 ],
                 usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
